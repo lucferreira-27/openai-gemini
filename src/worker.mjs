@@ -51,6 +51,7 @@ async function handleRequest(req, apiKey) {
   if (req.stream) { url += "?alt=sse"; }
   let response;
   try {
+    console.log("Debug: Request to Gemini API", JSON.stringify(await transformRequest(req), null, 2));
     response = await fetch(url, {
       method: "POST",
       headers: {
@@ -58,10 +59,11 @@ async function handleRequest(req, apiKey) {
         "x-goog-api-key": apiKey,
         "x-goog-api-client": API_CLIENT,
       },
-      body: JSON.stringify(await transformRequest(req)), // try
+      body: JSON.stringify(await transformRequest(req)),
     });
+    console.log("Debug: Response status from Gemini API", response.status);
   } catch (err) {
-    console.error(err);
+    console.error("Debug: Error in fetch", err);
     return new Response(err, { status: 400, headers: {"Access-Control-Allow-Origin": "*"} });
   }
 
@@ -88,6 +90,7 @@ async function handleRequest(req, apiKey) {
       body = await response.text();
       try {
         body = await processResponse(JSON.parse(body), model, id);
+        console.log(body);
       } catch (err) {
         console.error(err);
         response = { status: 500 };
@@ -214,11 +217,52 @@ const transformMessages = async (messages) => {
   return { system_instruction, contents };
 };
 
-const transformRequest = async (req) => ({
-  ...await transformMessages(req.messages),
-  safetySettings,
-  generationConfig: transformConfig(req),
-});
+const transformRequest = async (req) => {
+  console.log("Debug: Original request", JSON.stringify(req, null, 2));
+  const transformed = {
+    ...await transformMessages(req.messages),
+    safetySettings,
+    generationConfig: transformConfig(req),
+    tools: transformTools(req.tools),
+  };
+  console.log("Debug: Transformed request", JSON.stringify(transformed, null, 2));
+  return transformed;
+};
+
+const transformTools = (tools) => {
+  console.log("Debug: Original tools", JSON.stringify(tools, null, 2));
+  if (!tools) return undefined;
+  const transformed = [{
+    function_declarations: tools
+      .filter(tool => tool.type === "function")
+      .map(tool => transformFunctionToDeclaration(tool.function))
+  }];
+  console.log("Debug: Transformed tools", JSON.stringify(transformed, null, 2));
+  return transformed;
+};
+
+const transformFunctionToDeclaration = (func) => {
+  console.log("Debug: Original function", JSON.stringify(func, null, 2));
+  const transformed = {
+    name: func.name,
+    description: func.description,
+    parameters: {
+      type: "OBJECT",
+      properties: Object.fromEntries(
+        Object.entries(func.parameters.properties).map(([key, value]) => [
+          key,
+          {
+            type: value.type.toUpperCase(),
+            description: value.description
+          }
+        ])
+      ),
+      required: func.parameters.required || []
+    }
+  };
+  console.log("Debug: Transformed function", JSON.stringify(transformed, null, 2));
+  return transformed;
+};
 
 const generateChatcmplId = () => {
   const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -235,14 +279,42 @@ const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse
   //"OTHER": "OTHER",
   // :"function_call",
 };
-const transformCandidates = (key, cand) => ({
-  index: cand.index,
-  [key]: { role: "assistant", content: cand.content?.parts[0].text },
-  logprobs: null,
-  finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
-});
+const transformCandidates = (key, cand) => {
+  console.log("Debug: Transforming candidate", JSON.stringify(cand, null, 2));
+  const result = {
+    index: cand.index,
+    [key]: { role: "assistant", content: null, tool_calls: null },
+    logprobs: null,
+    finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
+  };
+  
+  if (cand.content?.parts[0].functionCall) {
+    result[key].tool_calls = [transformFunctionCallToToolCall(cand.content.parts[0].functionCall)];
+  } else if (cand.content?.parts[0].text) {
+    result[key].content = cand.content.parts[0].text;
+  }
+  
+  console.log("Debug: Transformed candidate", JSON.stringify(result, null, 2));
+  return result;
+};
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
 const transformCandidatesDelta = transformCandidates.bind(null, "delta");
+
+const transformFunctionCallToToolCall = (functionCall) => {
+  console.log("Debug: transformFunctionCallToToolCall: ", JSON.stringify(functionCall, null, 2));
+
+  let args = functionCall.args || {};
+  let stringifiedArgs = JSON.stringify(args);
+
+  return {
+    id: `call_${Math.random().toString(36).substr(2, 9)}`,
+    type: "function",
+    function: {
+      name: functionCall.name,
+      arguments: stringifiedArgs
+    }
+  };
+};
 
 const transformUsage = (data) => ({
   completion_tokens: data.candidatesTokenCount,
@@ -251,15 +323,18 @@ const transformUsage = (data) => ({
 });
 
 const processResponse = async (data, model, id) => {
-  return JSON.stringify({
+  console.log("Debug: Raw response from Gemini API", JSON.stringify(data, null, 2));
+  const processed = JSON.stringify({
     id,
     choices: data.candidates.map(transformCandidatesMessage),
     created: Math.floor(Date.now()/1000),
     model,
-    //system_fingerprint: "fp_69829325d0",
     object: "chat.completion",
     usage: transformUsage(data.usageMetadata),
+    system_fingerprint: `fp_${Math.random().toString(36).substr(2, 16)}` // Generate a random fingerprint
   });
+  console.log("Debug: Processed response", processed);
+  return processed;
 };
 
 const responseLineRE = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
@@ -284,13 +359,22 @@ async function parseStreamFlush (controller) {
 function transformResponseStream (data, stop, first) {
   const item = transformCandidatesDelta(data.candidates[0]);
   if (stop) { item.delta = {}; } else { item.finish_reason = null; }
-  if (first) { item.delta.content = ""; } else { delete item.delta.role; }
+  if (first) {
+    item.delta.content = "";
+    if (data.candidates[0].content?.parts[0].functionCall) {
+      item.delta.function_call = {
+        name: data.candidates[0].content.parts[0].functionCall.name,
+        arguments: ""
+      };
+    }
+  } else {
+    delete item.delta.role;
+  }
   const output = {
     id: this.id,
     choices: [item],
     created: Math.floor(Date.now()/1000),
     model: this.model,
-    //system_fingerprint: "fp_69829325d0",
     object: "chat.completion.chunk",
   };
   if (stop && data.usageMetadata) {
@@ -312,7 +396,7 @@ async function toOpenAiStream (chunk, controller) {
     const length = this.last.length || 1; // at least 1 error msg
     const candidates = Array.from({ length }, (_, index) => ({
       finishReason: "error",
-      content: { parts: [{ text: err }] },
+      content: { parts: [{ text: err.toString() }] },
       index,
     }));
     data = { candidates };
